@@ -76,38 +76,52 @@ __global__ void sample_kernel(float* logits, int* indices, float* probs, int top
     sample_token[b] = batch_indices[k < topk ? k : topk - 1];
 }
 
+__global__ void compute_topk_probs_kernel(float* logits, int topk, int vocab_size, int batch_size, float* probs) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch_size) return;
+    float* batch_logits = logits + b * vocab_size;
+    float max_val = batch_logits[0];
+    for (int k = 1; k < topk; ++k) {
+        if (batch_logits[k] > max_val) max_val = batch_logits[k];
+    }
+    float sum_exp = 0.0f;
+    for (int k = 0; k < topk; ++k) {
+        float exp_val = expf(batch_logits[k] - max_val);
+        probs[b * topk + k] = exp_val;
+        sum_exp += exp_val;
+    }
+    for (int k = 0; k < topk; ++k) {
+        probs[b * topk + k] /= sum_exp;
+    }
+}
+
 void sample_topk_cuda(float* logits, int topk, float temperature, int vocab_size, int batch_size, int* sample_token) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
-
     int* d_indices;
     float* d_probs;
     CUDA_CHECK(cudaMalloc(&d_indices, batch_size * vocab_size * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_probs, batch_size * topk * sizeof(float)));
-
     thrust::device_ptr<int> indices_ptr(d_indices);
     thrust::sequence(thrust::device, indices_ptr, indices_ptr + batch_size * vocab_size);
-
     float alpha = 1.0f / temperature;
     CUBLAS_CHECK(cublasSscal(handle, batch_size * vocab_size, &alpha, logits, 1));
-
     for (int b = 0; b < batch_size; ++b) {
         thrust::device_ptr<float> logits_ptr(logits + b * vocab_size);
         thrust::sort_by_key(thrust::device, logits_ptr, logits_ptr + vocab_size, indices_ptr + b * vocab_size, thrust::greater<float>());
     }
-
-    unsigned long long seed = static_cast<unsigned long long>(time(NULL));
     int threads_per_block = 256;
     int blocks_per_grid = (batch_size + threads_per_block - 1) / threads_per_block;
-    sample_kernel<<<blocks_per_grid, threads_per_block>>>(logits, d_indices, d_probs, topk, vocab_size, batch_size, sample_token, seed);
+    compute_topk_probs_kernel<<<blocks_per_grid, threads_per_block>>>(logits, topk, vocab_size, batch_size, d_probs);
     CUDA_CHECK(cudaGetLastError());
-
+    sample_kernel<<<blocks_per_grid, threads_per_block>>>(logits, d_indices, d_probs, topk, vocab_size, batch_size, sample_token, static_cast<unsigned long long>(time(NULL)));
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(d_indices));
     CUDA_CHECK(cudaFree(d_probs));
     CUBLAS_CHECK(cublasDestroy(handle));
 }
 
-}  // namespace cuda_utils
+}
 
 namespace cuda_nn {
 
@@ -145,22 +159,27 @@ __global__ void add_bias(float* out, const float* bias, int out_features, int to
 }
 
 void linear_forward_cuda(const float* input, int batch_size, int seq_len, int in_features, int out_features, const float* weight, const float* bias, float* output) {
+    if (batch_size <= 0 || seq_len <= 0 || in_features <= 0 || out_features <= 0) {
+        fprintf(stderr, "Invalid dimensions: batch_size=%d, seq_len=%d, in_features=%d, out_features=%d\n", batch_size, seq_len, in_features, out_features);
+        exit(EXIT_FAILURE);
+    }
+    if (!input || !weight || !bias || !output) {
+        fprintf(stderr, "Null pointer detected in linear_forward_cuda\n");
+        exit(EXIT_FAILURE);
+    }
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
-
     float alpha = 1.0f, beta = 0.0f;
     int m = out_features;
     int n = batch_size * seq_len;
     int k = in_features;
-
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, weight, m, input, k, &beta, output, m));
-
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, m, n, k, &alpha, (float*)weight, k, (float*)input, n, &beta, output, m));
     int total = batch_size * seq_len * out_features;
     int threads_per_block = 256;
     int blocks_per_grid = (total + threads_per_block - 1) / threads_per_block;
     add_bias<<<blocks_per_grid, threads_per_block>>>(output, bias, out_features, total);
     CUDA_CHECK(cudaGetLastError());
-
     CUBLAS_CHECK(cublasDestroy(handle));
 }
 
@@ -172,14 +191,12 @@ __global__ void softmax_kernel(float* scores, const bool* mask, int batch_size, 
     int h = (idx % (num_heads * seq_len)) / seq_len;
     int i = idx % seq_len;
     float* score_row = scores + (b * num_heads + h) * seq_len * seq_len + i * seq_len;
-
     float max_val = -INFINITY;
-    for (int j = 0; j <= i; ++j) {  // Causal mask: j <= i
+    for (int j = 0; j <= i; ++j) {
         if (mask[b * max_seq_len + j]) {
             max_val = fmaxf(max_val, score_row[j]);
         }
     }
-
     float sum_exp = 0.0f;
     for (int j = 0; j <= i; ++j) {
         if (mask[b * max_seq_len + j]) {
@@ -189,7 +206,6 @@ __global__ void softmax_kernel(float* scores, const bool* mask, int batch_size, 
             score_row[j] = 0.0f;
         }
     }
-
     for (int j = 0; j < seq_len; ++j) {
         score_row[j] /= sum_exp;
     }
@@ -202,14 +218,11 @@ void attention_forward_cuda(
 ) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
-
     int total_batch = batch_size * num_heads;
     float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     float alpha = scale, beta = 0.0f;
-
     float* scores;
     CUDA_CHECK(cudaMalloc(&scores, total_batch * seq_len * seq_len * sizeof(float)));
-
     CUBLAS_CHECK(cublasSgemmStridedBatched(
         handle, CUBLAS_OP_T, CUBLAS_OP_N,
         seq_len, seq_len, head_dim,
@@ -218,12 +231,10 @@ void attention_forward_cuda(
         &beta, scores, seq_len, seq_len * seq_len,
         total_batch
     ));
-
     int threads_per_block = 256;
     int blocks_per_grid = (total_batch * seq_len + threads_per_block - 1) / threads_per_block;
     softmax_kernel<<<blocks_per_grid, threads_per_block>>>(scores, mask, batch_size, num_heads, seq_len, max_seq_len);
     CUDA_CHECK(cudaGetLastError());
-
     CUBLAS_CHECK(cublasSgemmStridedBatched(
         handle, CUBLAS_OP_N, CUBLAS_OP_N,
         head_dim, seq_len, seq_len,
@@ -232,7 +243,6 @@ void attention_forward_cuda(
         &beta, output, head_dim, seq_len * head_dim,
         total_batch
     ));
-
     CUDA_CHECK(cudaFree(scores));
     CUBLAS_CHECK(cublasDestroy(handle));
 }
@@ -264,23 +274,19 @@ __global__ void layer_norm_kernel(float* input, const float* gamma, const float*
     int row = blockIdx.x;
     int tid = threadIdx.x;
     if (row >= rows) return;
-
     float* row_data = input + row * cols;
     float* out_row = output + row * cols;
-
     float sum = 0.0f;
     for (int i = tid; i < cols; i += blockDim.x) {
         sum += row_data[i];
     }
     shared[tid] = sum;
     __syncthreads();
-
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) shared[tid] += shared[tid + s];
         __syncthreads();
     }
     float mean = shared[0] / cols;
-
     sum = 0.0f;
     for (int i = tid; i < cols; i += blockDim.x) {
         float diff = row_data[i] - mean;
@@ -288,13 +294,11 @@ __global__ void layer_norm_kernel(float* input, const float* gamma, const float*
     }
     shared[tid] = sum;
     __syncthreads();
-
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) shared[tid] += shared[tid + s];
         __syncthreads();
     }
     float variance = shared[0] / cols;
-
     for (int i = tid; i < cols; i += blockDim.x) {
         out_row[i] = gamma[i] * (row_data[i] - mean) / sqrtf(variance + 1e-5f) + beta[i];
     }
@@ -319,49 +323,40 @@ void transformer_decoder_forward_cuda(
 ) {
     size_t hidden_size = batch_size * seq_len * num_heads * head_dim * sizeof(float);
     size_t qkv_size = hidden_size * 3;
-
     float *current, *qkv_out, *attn_out, *mlp_out, *temp;
     CUDA_CHECK(cudaMalloc(&current, hidden_size));
     CUDA_CHECK(cudaMalloc(&qkv_out, qkv_size));
     CUDA_CHECK(cudaMalloc(&attn_out, hidden_size));
     CUDA_CHECK(cudaMalloc(&mlp_out, hidden_size));
     CUDA_CHECK(cudaMalloc(&temp, hidden_size));
-
     CUDA_CHECK(cudaMemcpy(current, input, hidden_size, cudaMemcpyDeviceToDevice));
-
     for (int l = 0; l < num_layers; ++l) {
+        if (!q_weights[l] || !q_biases[l] || !qkv_out) {
+            fprintf(stderr, "Null pointer detected at layer %d\n", l);
+            exit(EXIT_FAILURE);
+        }
         linear_forward_cuda(current, batch_size, seq_len, num_heads * head_dim, num_heads * head_dim * 3,
                             q_weights[l], q_biases[l], qkv_out);
-
         float* Q = qkv_out;
         float* K = qkv_out + batch_size * seq_len * num_heads * head_dim;
         float* V = qkv_out + 2 * batch_size * seq_len * num_heads * head_dim;
-
         attention_forward_cuda(Q, K, V, mask, batch_size, seq_len, seq_len, num_heads, head_dim, attn_out);
-
         linear_forward_cuda(attn_out, batch_size, seq_len, num_heads * head_dim, num_heads * head_dim,
                             out_weights[l], out_biases[l], temp);
-
         int total_elements = batch_size * seq_len * num_heads * head_dim;
         int threads_per_block = 256;
         int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
         elementwise_add<<<blocks_per_grid, threads_per_block>>>(current, temp, total_elements, temp);
-
         layer_norm_cuda(temp, sa_norm_weights[l], sa_norm_biases[l], batch_size * seq_len, num_heads * head_dim, current);
-
         linear_forward_cuda(current, batch_size, seq_len, num_heads * head_dim, num_heads * head_dim * 4,
                             mlp_0_weights[l], mlp_0_biases[l], temp);
         gelu_cuda(temp, batch_size * seq_len * num_heads * head_dim * 4);
-
         linear_forward_cuda(temp, batch_size, seq_len, num_heads * head_dim * 4, num_heads * head_dim,
                             mlp_2_weights[l], mlp_2_biases[l], mlp_out);
-
         elementwise_add<<<blocks_per_grid, threads_per_block>>>(current, mlp_out, total_elements, temp);
         layer_norm_cuda(temp, mlp_norm_weights[l], mlp_norm_biases[l], batch_size * seq_len, num_heads * head_dim, current);
     }
-
     layer_norm_cuda(current, norm_weights, norm_biases, batch_size * seq_len, num_heads * head_dim, output);
-
     CUDA_CHECK(cudaFree(current));
     CUDA_CHECK(cudaFree(qkv_out));
     CUDA_CHECK(cudaFree(attn_out));
@@ -369,29 +364,24 @@ void transformer_decoder_forward_cuda(
     CUDA_CHECK(cudaFree(temp));
 }
 
-}  // namespace cuda_nn
+}
 
 extern "C" {
     void create_causal_mask_cuda(int seq_len, bool* mask) {
         cuda_utils::create_causal_mask_cuda(seq_len, mask);
     }
-
     void index_causal_mask_cuda(const int* input_pos, int batch_size, int seq_len, int max_seq_len, bool* result_mask) {
         cuda_utils::index_causal_mask_cuda(input_pos, batch_size, seq_len, max_seq_len, result_mask);
     }
-
     void sample_topk_cuda(float* logits, int topk, float temperature, int vocab_size, int batch_size, int* sample_token) {
         cuda_utils::sample_topk_cuda(logits, topk, temperature, vocab_size, batch_size, sample_token);
     }
-
     void embedding_forward_cuda(const int* input, int batch_size, int seq_len, int vocab_size, int embedding_dim, const float* weight, float* output) {
         cuda_nn::embedding_forward_cuda(input, batch_size, seq_len, vocab_size, embedding_dim, weight, output);
     }
-
     void linear_forward_cuda(const float* input, int batch_size, int seq_len, int in_features, int out_features, const float* weight, const float* bias, float* output) {
         cuda_nn::linear_forward_cuda(input, batch_size, seq_len, in_features, out_features, weight, bias, output);
     }
-
     void transformer_decoder_forward_cuda(
         const float* input, int batch_size, int seq_len, int num_layers, int num_heads, int head_dim,
         const float** q_weights, const float** k_weights, const float** v_weights, const float** out_weights,
@@ -408,4 +398,5 @@ extern "C" {
                                                   sa_norm_weights, mlp_norm_weights, sa_norm_biases, mlp_norm_biases,
                                                   norm_weights, norm_biases, mask, output);
     }
-} // extern "C"
+}
+
