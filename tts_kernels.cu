@@ -9,23 +9,11 @@
 #include <cstdlib>
 #include <cmath>
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
+#define CUDA_CHECK(call) do { cudaError_t err = call; if (err != cudaSuccess) { \
+    fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); exit(EXIT_FAILURE); } } while (0)
 
-#define CUBLAS_CHECK(call) \
-    do { \
-        cublasStatus_t status = call; \
-        if (status != CUBLAS_STATUS_SUCCESS) { \
-            fprintf(stderr, "CUBLAS error %d in %s at line %d\n", status, __FILE__, __LINE__); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
+#define CUBLAS_CHECK(call) do { cublasStatus_t status = call; if (status != CUBLAS_STATUS_SUCCESS) { \
+    fprintf(stderr, "CUBLAS error %d in %s at line %d\n", status, __FILE__, __LINE__); exit(EXIT_FAILURE); } } while (0)
 
 namespace cuda_utils {
 
@@ -64,47 +52,60 @@ __global__ void sample_kernel(float* logits, int* indices, float* probs, int top
     if (b >= batch_size) return;
     curandState state;
     curand_init(seed, b, 0, &state);
-    float* batch_probs = probs + b * topk;
     int* batch_indices = indices + b * vocab_size;
-    float cumsum = 0.0f;
-    float u = curand_uniform(&state);
-    int k;
-    for (k = 0; k < topk; k++) {
-        cumsum += batch_probs[k];
-        if (cumsum > u) break;
+    float topk_sum = 0.0f;
+    for (int k = 0; k < topk; k++) {
+        int idx = batch_indices[k];
+        topk_sum += probs[b * vocab_size + idx];
     }
-    sample_token[b] = batch_indices[k < topk ? k : topk - 1];
+    float u = curand_uniform(&state) * topk_sum;
+    float cumsum = 0.0f;
+    for (int k = 0; k < topk; k++) {
+        int idx = batch_indices[k];
+        float prob = probs[b * vocab_size + idx];
+        cumsum += prob;
+        if (cumsum > u) {
+            sample_token[b] = idx;
+            return;
+        }
+    }
+    sample_token[b] = batch_indices[topk - 1];
 }
 
 __global__ void compute_topk_probs_kernel(float* logits, int topk, int vocab_size, int batch_size, float* probs) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch_size) return;
     float* batch_logits = logits + b * vocab_size;
-    float max_val = batch_logits[0];
-    for (int k = 1; k < topk; ++k) {
-        if (batch_logits[k] > max_val) max_val = batch_logits[k];
+    float max_val = -INFINITY;
+    for (int k = 0; k < vocab_size; ++k) {
+        float val = batch_logits[k];
+        if (val > max_val) max_val = val;
     }
     float sum_exp = 0.0f;
-    for (int k = 0; k < topk; ++k) {
+    for (int k = 0; k < vocab_size; ++k) {
         float exp_val = expf(batch_logits[k] - max_val);
-        probs[b * topk + k] = exp_val;
+        probs[b * vocab_size + k] = exp_val;
         sum_exp += exp_val;
     }
-    for (int k = 0; k < topk; ++k) {
-        probs[b * topk + k] /= sum_exp;
+    for (int k = 0; k < vocab_size; ++k) {
+        probs[b * vocab_size + k] = probs[b * vocab_size + k] / sum_exp;
     }
 }
 
-void sample_topk_cuda(float* logits, int topk, float temperature, int vocab_size, int batch_size, int* sample_token) {
+void sample_topk_cuda(float* logits, int batch_size, float temperature, int topk, int vocab_size, int* sample_token) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
     int* d_indices;
     float* d_probs;
     CUDA_CHECK(cudaMalloc(&d_indices, batch_size * vocab_size * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_probs, batch_size * topk * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_probs, batch_size * vocab_size * sizeof(float)));
     thrust::device_ptr<int> indices_ptr(d_indices);
     thrust::sequence(thrust::device, indices_ptr, indices_ptr + batch_size * vocab_size);
     float alpha = 1.0f / temperature;
+    float beta = 0.0f;
+    // Scale the logits in place using float GEMM scaling (if needed, you can use cublasSscal)
     CUBLAS_CHECK(cublasSscal(handle, batch_size * vocab_size, &alpha, logits, 1));
     for (int b = 0; b < batch_size; ++b) {
         thrust::device_ptr<float> logits_ptr(logits + b * vocab_size);
@@ -121,7 +122,7 @@ void sample_topk_cuda(float* logits, int topk, float temperature, int vocab_size
     CUBLAS_CHECK(cublasDestroy(handle));
 }
 
-}
+} // namespace cuda_utils
 
 namespace cuda_nn {
 
@@ -132,15 +133,8 @@ __global__ void embedding_forward_kernel(const int* input, int batch_size, int s
         int token = input[b * seq_len + s];
         float* out_ptr = output + (b * seq_len + s) * embedding_dim;
         const float* weight_ptr = weight + token * embedding_dim;
-        for (int d = 0; d < embedding_dim; d += 4) {
-            if (d + 4 <= embedding_dim) {
-                float4 emb = *reinterpret_cast<const float4*>(weight_ptr + d);
-                *reinterpret_cast<float4*>(out_ptr + d) = emb;
-            } else {
-                for (int i = d; i < embedding_dim; ++i) {
-                    out_ptr[i] = weight_ptr[i];
-                }
-            }
+        for (int d = 0; d < embedding_dim; ++d) {
+            out_ptr[d] = weight_ptr[d];
         }
     }
 }
@@ -154,8 +148,9 @@ void embedding_forward_cuda(const int* input, int batch_size, int seq_len, int v
 
 __global__ void add_bias(float* out, const float* bias, int out_features, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total)
-        out[idx] += bias[idx % out_features];
+    if (idx < total) {
+        out[idx] = out[idx] + bias[idx % out_features];
+    }
 }
 
 void linear_forward_cuda(const float* input, int batch_size, int seq_len, int in_features, int out_features, const float* weight, const float* bias, float* output) {
@@ -169,12 +164,22 @@ void linear_forward_cuda(const float* input, int batch_size, int seq_len, int in
     }
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
-    float alpha = 1.0f, beta = 0.0f;
-    int m = out_features;
-    int n = batch_size * seq_len;
-    int k = in_features;
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, m, n, k, &alpha, (float*)weight, k, (float*)input, n, &beta, output, m));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    int m = out_features;           // Rows of output
+    int n = batch_size * seq_len;   // Columns of output
+    int k = in_features;            // Shared dimension
+
+    // Revised GEMM call: use CUDA_R_32F.
+    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+                              m, n, k,
+                              &alpha, weight, CUDA_R_32F, m,
+                              input, CUDA_R_32F, k,
+                              &beta, output, CUDA_R_32F, m,
+                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
     int total = batch_size * seq_len * out_features;
     int threads_per_block = 256;
     int blocks_per_grid = (total + threads_per_block - 1) / threads_per_block;
@@ -194,7 +199,8 @@ __global__ void softmax_kernel(float* scores, const bool* mask, int batch_size, 
     float max_val = -INFINITY;
     for (int j = 0; j <= i; ++j) {
         if (mask[b * max_seq_len + j]) {
-            max_val = fmaxf(max_val, score_row[j]);
+            float val = score_row[j];
+            if(val > max_val) max_val = val;
         }
     }
     float sum_exp = 0.0f;
@@ -207,7 +213,7 @@ __global__ void softmax_kernel(float* scores, const bool* mask, int batch_size, 
         }
     }
     for (int j = 0; j < seq_len; ++j) {
-        score_row[j] /= sum_exp;
+        score_row[j] = score_row[j] / sum_exp;
     }
 }
 
@@ -218,31 +224,31 @@ void attention_forward_cuda(
 ) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
     int total_batch = batch_size * num_heads;
     float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     float alpha = scale, beta = 0.0f;
     float* scores;
     CUDA_CHECK(cudaMalloc(&scores, total_batch * seq_len * seq_len * sizeof(float)));
-    CUBLAS_CHECK(cublasSgemmStridedBatched(
-        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+        handle, CUBLAS_OP_N, CUBLAS_OP_T,
         seq_len, seq_len, head_dim,
-        &alpha, K, head_dim, seq_len * head_dim,
-        Q, head_dim, seq_len * head_dim,
-        &beta, scores, seq_len, seq_len * seq_len,
-        total_batch
-    ));
+        &alpha, Q, CUDA_R_32F, head_dim, seq_len * head_dim,
+        K, CUDA_R_32F, head_dim, seq_len * head_dim,
+        &beta, scores, CUDA_R_32F, seq_len, seq_len * seq_len,
+        total_batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     int threads_per_block = 256;
     int blocks_per_grid = (total_batch * seq_len + threads_per_block - 1) / threads_per_block;
     softmax_kernel<<<blocks_per_grid, threads_per_block>>>(scores, mask, batch_size, num_heads, seq_len, max_seq_len);
     CUDA_CHECK(cudaGetLastError());
-    CUBLAS_CHECK(cublasSgemmStridedBatched(
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
         handle, CUBLAS_OP_N, CUBLAS_OP_N,
         head_dim, seq_len, seq_len,
-        &alpha, V, head_dim, seq_len * head_dim,
-        scores, seq_len, seq_len * seq_len,
-        &beta, output, head_dim, seq_len * head_dim,
-        total_batch
-    ));
+        &alpha, V, CUDA_R_32F, head_dim, seq_len * head_dim,
+        scores, CUDA_R_32F, seq_len, seq_len * seq_len,
+        &beta, output, CUDA_R_32F, head_dim, seq_len * head_dim,
+        total_batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     CUDA_CHECK(cudaFree(scores));
     CUBLAS_CHECK(cublasDestroy(handle));
 }
@@ -258,7 +264,8 @@ __global__ void gelu_kernel(float* x, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
         float val = x[i];
-        x[i] = 0.5 * val * (1.0 + tanhf(sqrtf(2.0 / M_PI) * (val + 0.044715 * val * val * val)));
+        float gelu = 0.5f * val * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (val + 0.044715f * val * val * val)));
+        x[i] = gelu;
     }
 }
 
@@ -299,8 +306,10 @@ __global__ void layer_norm_kernel(float* input, const float* gamma, const float*
         __syncthreads();
     }
     float variance = shared[0] / cols;
+    float eps = 1e-5f;
+    float inv_std = 1.0f / sqrtf(variance + eps);
     for (int i = tid; i < cols; i += blockDim.x) {
-        out_row[i] = gamma[i] * (row_data[i] - mean) / sqrtf(variance + 1e-5f) + beta[i];
+        out_row[i] = gamma[i] * ((row_data[i] - mean) * inv_std) + beta[i];
     }
 }
 
@@ -312,59 +321,87 @@ void layer_norm_cuda(float* input, const float* gamma, const float* beta, int ro
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void reshape_kernel(const float* input, float* output, int batch_size, int seq_len, int num_heads, int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * num_heads * seq_len * head_dim;
+    if (idx >= total) return;
+    int d = idx % head_dim;
+    int s = (idx / head_dim) % seq_len;
+    int nh = (idx / (head_dim * seq_len)) % num_heads;
+    int b = idx / (head_dim * seq_len * num_heads);
+    int input_idx = (b * seq_len + s) * (num_heads * head_dim) + nh * head_dim + d;
+    output[idx] = input[input_idx];
+}
+
+void reshape(const float* input, float* output, int batch_size, int seq_len, int num_heads, int head_dim) {
+    int total = batch_size * num_heads * seq_len * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    reshape_kernel<<<blocks, threads>>>(input, output, batch_size, seq_len, num_heads, head_dim);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void transformer_decoder_forward_cuda(
-    const float* input, int batch_size, int seq_len, int num_layers, int num_heads, int head_dim,
-    const float** q_weights, const float** k_weights, const float** v_weights, const float** out_weights,
-    const float** q_biases, const float** k_biases, const float** v_biases, const float** out_biases,
-    const float** mlp_0_weights, const float** mlp_2_weights, const float** mlp_0_biases, const float** mlp_2_biases,
-    const float** sa_norm_weights, const float** mlp_norm_weights, const float** sa_norm_biases, const float** mlp_norm_biases,
-    const float* norm_weights, const float* norm_biases,
+    float* input, int batch_size, int seq_len, int embedding_dim, int num_heads, int intermediate_dim,
+    const float* q_weight, const float* q_bias,
+    const float* k_weight, const float* k_bias,
+    const float* v_weight, const float* v_bias,
+    const float* out_weight, const float* out_bias,
+    const float* mlp_w1_weight, const float* mlp_w1_bias,
+    const float* mlp_w2_weight, const float* mlp_w2_bias,
+    const float* sa_norm_weight, const float* sa_norm_bias,
+    const float* mlp_norm_weight, const float* mlp_norm_bias,
     const bool* mask, float* output
 ) {
-    size_t hidden_size = batch_size * seq_len * num_heads * head_dim * sizeof(float);
-    size_t qkv_size = hidden_size * 3;
-    float *current, *qkv_out, *attn_out, *mlp_out, *temp;
+    int head_dim = embedding_dim / num_heads;
+    size_t hidden_size = batch_size * seq_len * embedding_dim * sizeof(float);
+    float *current, *attn_out, *mlp_out, *temp;
     CUDA_CHECK(cudaMalloc(&current, hidden_size));
-    CUDA_CHECK(cudaMalloc(&qkv_out, qkv_size));
     CUDA_CHECK(cudaMalloc(&attn_out, hidden_size));
     CUDA_CHECK(cudaMalloc(&mlp_out, hidden_size));
     CUDA_CHECK(cudaMalloc(&temp, hidden_size));
     CUDA_CHECK(cudaMemcpy(current, input, hidden_size, cudaMemcpyDeviceToDevice));
-    for (int l = 0; l < num_layers; ++l) {
-        if (!q_weights[l] || !q_biases[l] || !qkv_out) {
-            fprintf(stderr, "Null pointer detected at layer %d\n", l);
-            exit(EXIT_FAILURE);
-        }
-        linear_forward_cuda(current, batch_size, seq_len, num_heads * head_dim, num_heads * head_dim * 3,
-                            q_weights[l], q_biases[l], qkv_out);
-        float* Q = qkv_out;
-        float* K = qkv_out + batch_size * seq_len * num_heads * head_dim;
-        float* V = qkv_out + 2 * batch_size * seq_len * num_heads * head_dim;
-        attention_forward_cuda(Q, K, V, mask, batch_size, seq_len, seq_len, num_heads, head_dim, attn_out);
-        linear_forward_cuda(attn_out, batch_size, seq_len, num_heads * head_dim, num_heads * head_dim,
-                            out_weights[l], out_biases[l], temp);
-        int total_elements = batch_size * seq_len * num_heads * head_dim;
-        int threads_per_block = 256;
-        int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
-        elementwise_add<<<blocks_per_grid, threads_per_block>>>(current, temp, total_elements, temp);
-        layer_norm_cuda(temp, sa_norm_weights[l], sa_norm_biases[l], batch_size * seq_len, num_heads * head_dim, current);
-        linear_forward_cuda(current, batch_size, seq_len, num_heads * head_dim, num_heads * head_dim * 4,
-                            mlp_0_weights[l], mlp_0_biases[l], temp);
-        gelu_cuda(temp, batch_size * seq_len * num_heads * head_dim * 4);
-        linear_forward_cuda(temp, batch_size, seq_len, num_heads * head_dim * 4, num_heads * head_dim,
-                            mlp_2_weights[l], mlp_2_biases[l], mlp_out);
-        elementwise_add<<<blocks_per_grid, threads_per_block>>>(current, mlp_out, total_elements, temp);
-        layer_norm_cuda(temp, mlp_norm_weights[l], mlp_norm_biases[l], batch_size * seq_len, num_heads * head_dim, current);
-    }
-    layer_norm_cuda(current, norm_weights, norm_biases, batch_size * seq_len, num_heads * head_dim, output);
+    float *Q, *K, *V;
+    CUDA_CHECK(cudaMalloc(&Q, hidden_size));
+    CUDA_CHECK(cudaMalloc(&K, hidden_size));
+    CUDA_CHECK(cudaMalloc(&V, hidden_size));
+    linear_forward_cuda(current, batch_size, seq_len, embedding_dim, embedding_dim, q_weight, q_bias, Q);
+    linear_forward_cuda(current, batch_size, seq_len, embedding_dim, embedding_dim, k_weight, k_bias, K);
+    linear_forward_cuda(current, batch_size, seq_len, embedding_dim, embedding_dim, v_weight, v_bias, V);
+    float *Q_reshaped, *K_reshaped, *V_reshaped;
+    size_t reshape_size = batch_size * num_heads * seq_len * head_dim * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&Q_reshaped, reshape_size));
+    CUDA_CHECK(cudaMalloc(&K_reshaped, reshape_size));
+    CUDA_CHECK(cudaMalloc(&V_reshaped, reshape_size));
+    reshape(Q, Q_reshaped, batch_size, seq_len, num_heads, head_dim);
+    reshape(K, K_reshaped, batch_size, seq_len, num_heads, head_dim);
+    reshape(V, V_reshaped, batch_size, seq_len, num_heads, head_dim);
+    attention_forward_cuda(Q_reshaped, K_reshaped, V_reshaped, mask, batch_size, seq_len, seq_len, num_heads, head_dim, attn_out);
+    CUDA_CHECK(cudaFree(Q));
+    CUDA_CHECK(cudaFree(K));
+    CUDA_CHECK(cudaFree(V));
+    CUDA_CHECK(cudaFree(Q_reshaped));
+    CUDA_CHECK(cudaFree(K_reshaped));
+    CUDA_CHECK(cudaFree(V_reshaped));
+    linear_forward_cuda(attn_out, batch_size, seq_len, embedding_dim, embedding_dim, out_weight, out_bias, temp);
+    int total_elements = batch_size * seq_len * embedding_dim;
+    int threads_per_block = 256;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+    elementwise_add<<<blocks_per_grid, threads_per_block>>>(current, temp, total_elements, temp);
+    layer_norm_cuda(temp, sa_norm_weight, sa_norm_bias, batch_size * seq_len, embedding_dim, current);
+    linear_forward_cuda(current, batch_size, seq_len, embedding_dim, intermediate_dim, mlp_w1_weight, mlp_w1_bias, temp);
+    gelu_cuda(temp, batch_size * seq_len * intermediate_dim);
+    linear_forward_cuda(temp, batch_size, seq_len, intermediate_dim, embedding_dim, mlp_w2_weight, mlp_w2_bias, mlp_out);
+    elementwise_add<<<blocks_per_grid, threads_per_block>>>(current, mlp_out, total_elements, temp);
+    layer_norm_cuda(temp, mlp_norm_weight, mlp_norm_bias, batch_size * seq_len, embedding_dim, current);
+    CUDA_CHECK(cudaMemcpy(output, current, hidden_size, cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaFree(current));
-    CUDA_CHECK(cudaFree(qkv_out));
     CUDA_CHECK(cudaFree(attn_out));
     CUDA_CHECK(cudaFree(mlp_out));
     CUDA_CHECK(cudaFree(temp));
 }
 
-}
+} // namespace cuda_nn
 
 extern "C" {
     void create_causal_mask_cuda(int seq_len, bool* mask) {
@@ -373,8 +410,8 @@ extern "C" {
     void index_causal_mask_cuda(const int* input_pos, int batch_size, int seq_len, int max_seq_len, bool* result_mask) {
         cuda_utils::index_causal_mask_cuda(input_pos, batch_size, seq_len, max_seq_len, result_mask);
     }
-    void sample_topk_cuda(float* logits, int topk, float temperature, int vocab_size, int batch_size, int* sample_token) {
-        cuda_utils::sample_topk_cuda(logits, topk, temperature, vocab_size, batch_size, sample_token);
+    void sample_topk_cuda(float* logits, int batch_size, float temperature, int topk, int vocab_size, int* sample_token) {
+        cuda_utils::sample_topk_cuda(logits, batch_size, temperature, topk, vocab_size, sample_token);
     }
     void embedding_forward_cuda(const int* input, int batch_size, int seq_len, int vocab_size, int embedding_dim, const float* weight, float* output) {
         cuda_nn::embedding_forward_cuda(input, batch_size, seq_len, vocab_size, embedding_dim, weight, output);
@@ -383,20 +420,22 @@ extern "C" {
         cuda_nn::linear_forward_cuda(input, batch_size, seq_len, in_features, out_features, weight, bias, output);
     }
     void transformer_decoder_forward_cuda(
-        const float* input, int batch_size, int seq_len, int num_layers, int num_heads, int head_dim,
-        const float** q_weights, const float** k_weights, const float** v_weights, const float** out_weights,
-        const float** q_biases, const float** k_biases, const float** v_biases, const float** out_biases,
-        const float** mlp_0_weights, const float** mlp_2_weights, const float** mlp_0_biases, const float** mlp_2_biases,
-        const float** sa_norm_weights, const float** mlp_norm_weights, const float** sa_norm_biases, const float** mlp_norm_biases,
-        const float* norm_weights, const float* norm_biases,
+        float* input, int batch_size, int seq_len, int embedding_dim, int num_heads, int intermediate_dim,
+        const float* q_weights, const float* q_biases,
+        const float* k_weights, const float* k_biases,
+        const float* v_weights, const float* v_biases,
+        const float* out_weights, const float* out_biases,
+        const float* mlp_w1_weights, const float* mlp_w1_biases,
+        const float* mlp_w2_weights, const float* mlp_w2_biases,
+        const float* sa_norm_weights, const float* sa_norm_biases,
+        const float* mlp_norm_weights, const float* mlp_norm_biases,
         const bool* mask, float* output
     ) {
-        cuda_nn::transformer_decoder_forward_cuda(input, batch_size, seq_len, num_layers, num_heads, head_dim,
-                                                  q_weights, k_weights, v_weights, out_weights,
-                                                  q_biases, k_biases, v_biases, out_biases,
-                                                  mlp_0_weights, mlp_2_weights, mlp_0_biases, mlp_2_biases,
-                                                  sa_norm_weights, mlp_norm_weights, sa_norm_biases, mlp_norm_biases,
-                                                  norm_weights, norm_biases, mask, output);
+        cuda_nn::transformer_decoder_forward_cuda(input, batch_size, seq_len, embedding_dim, num_heads, intermediate_dim,
+            q_weights, q_biases, k_weights, k_biases, v_weights, v_biases,
+            out_weights, out_biases, mlp_w1_weights, mlp_w1_biases,
+            mlp_w2_weights, mlp_w2_biases, sa_norm_weights, sa_norm_biases,
+            mlp_norm_weights, mlp_norm_biases, mask, output);
     }
 }
 
