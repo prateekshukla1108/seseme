@@ -125,25 +125,25 @@ namespace cuda_nn {
 // ### Neural Network Functions ###
 
 // Kernel for embedding forward pass (column-major layout)
-__global__ void embedding_forward_kernel(const int* input, int batch_size, int seq_len, int vocab_size, int embedding_dim, const float* weight, float* output) {
+__global__ void embedding_forward_kernel(const int* input, int batch_size, int seq_len, int embedding_dim, const float* weight, float* output) {
     int b = blockIdx.y * blockDim.y + threadIdx.y;  // batch index
     int s = blockIdx.x * blockDim.x + threadIdx.x;  // sequence index
     if (b < batch_size && s < seq_len) {
-        int token = input[s * batch_size + b];  // column-major: token index
-        float* out_ptr = output + (s * batch_size + b) * embedding_dim;
-        const float* weight_ptr = weight + token;
+        int token = input[b * seq_len + s];  // row-major: token index
+        float* out_ptr = output + (b * seq_len + s) * embedding_dim;
+        const float* weight_ptr = weight + token * embedding_dim;
         for (int d = 0; d < embedding_dim; ++d) {
-            out_ptr[d] = weight_ptr[d * vocab_size];
+            out_ptr[d] = weight_ptr[d];
         }
     }
 }
 
 // Function for embedding forward pass on the GPU
-void embedding_forward_cuda(const int* input, int batch_size, int seq_len, int vocab_size, int embedding_dim, const float* weight, float* output) {
+void embedding_forward_cuda(const int* input, int batch_size, int seq_len, int embedding_dim, const float* weight, float* output) {
     dim3 block_dim(32, 8);
     dim3 grid_dim((seq_len + block_dim.x - 1) / block_dim.x,
                   (batch_size + block_dim.y - 1) / block_dim.y);
-    embedding_forward_kernel<<<grid_dim, block_dim>>>(input, batch_size, seq_len, vocab_size, embedding_dim, weight, output);
+    embedding_forward_kernel<<<grid_dim, block_dim>>>(input, batch_size, seq_len, embedding_dim, weight, output);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -167,19 +167,23 @@ void linear_forward_cuda(const float* input, int batch_size, int seq_len, int in
     int m = batch_size * seq_len;  // number of rows
     int n = out_features;          // number of columns
     int k = in_features;
-    // Perform matrix multiplication: output = input * weight^T
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, 
-                             m, n, k, 
+    
+    // cuBLAS uses column-major ordering, but our tensors are row-major
+    // So we compute: output = weight * input^T (which is equivalent to input * weight^T in row-major)
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, 
+                             n, m, k, 
                              &alpha, 
-                             input, m,
                              weight, k,
+                             input, k,
                              &beta,
-                             output, m));
+                             output, n));
+                             
     // Add bias
     int total = m * n;
     int threads_per_block = 256;
     int blocks_per_grid = (total + threads_per_block - 1) / threads_per_block;
-    add_bias_kernel<<<blocks_per_grid, threads_per_block>>>(output, bias, m, n);
+    add_bias_kernel<<<blocks_per_grid, threads_per_block>>>(output, bias, n, m);
+    
     CUDA_CHECK(cudaGetLastError());
     CUBLAS_CHECK(cublasDestroy(handle));
 }
@@ -408,13 +412,13 @@ void transformer_decoder_forward_cuda(
     int strideA = seq_len * head_dim;
     int strideB = head_dim * seq_len;
     int strideC = seq_len * seq_len;
-    CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                           m, n, k,
+    CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                                           n, m, k,
                                            &alpha,
-                                           Q_reshaped, m, strideA,
-                                           K_transposed, k, strideB,
+                                           K_reshaped, k, strideB,
+                                           Q_reshaped, k, strideA,
                                            &beta,
-                                           scores, m, strideC,
+                                           scores, n, strideC,
                                            batch_size * num_heads));
 
     // Apply masked softmax
@@ -481,6 +485,13 @@ void transformer_decoder_forward_cuda(
     CUDA_CHECK(cudaFree(ln2));
     CUDA_CHECK(cudaFree(mlp_temp));
     CUDA_CHECK(cudaFree(mlp_out));
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
 } // namespace cuda_nn
@@ -501,9 +512,9 @@ void sample_topk_cuda(int* indices, float* probs, int topk, int batch_size, int 
     cuda_nn::sample_topk_cuda(indices, probs, topk, batch_size, vocab_size, sample_token);
 }
 
-void embedding_forward_cuda(const int* input, int batch_size, int seq_len, int vocab_size, int embedding_dim, 
+void embedding_forward_cuda(const int* input, int batch_size, int seq_len, int embedding_dim, 
                             const float* weight, float* output) {
-    cuda_nn::embedding_forward_cuda(input, batch_size, seq_len, vocab_size, embedding_dim, weight, output);
+    cuda_nn::embedding_forward_cuda(input, batch_size, seq_len, embedding_dim, weight, output);
 }
 
 void linear_forward_cuda(const float* input, int batch_size, int seq_len, int in_features, int out_features,
