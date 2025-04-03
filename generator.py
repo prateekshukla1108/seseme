@@ -162,6 +162,16 @@ class Generator:
 
         return audio
 
+    def generate_frame(
+        self,
+        tokens: torch.Tensor,
+        tokens_mask: torch.Tensor,
+        input_pos: torch.Tensor,
+        temperature: float,
+        topk: int,
+    ) -> torch.Tensor:
+        return self._model.generate_frame(tokens, tokens_mask, input_pos, temperature, topk)
+
 
 def load_csm_1b(device: str = "cuda") -> Generator:
     model = Model.from_pretrained("sesame/csm-1b")
